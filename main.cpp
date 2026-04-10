@@ -4,6 +4,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <array>
+#include <chrono>
+#include <iomanip>
 #include <vector>
 #include <string>
 #include <filesystem>
@@ -18,10 +20,20 @@
 
 using CountType = unsigned int;
 using TotalType = std::uint64_t;
+using Clock = std::chrono::steady_clock;
 
 
 int main(int argc, char* argv[]) {
     constexpr int expectedRanks = 16;
+    constexpr std::size_t timingPartCount = 7;
+    constexpr std::array<const char*, timingPartCount - 1> timingLabels = {
+        "Local file processing",
+        "Row counter reduction",
+        "File total reduction",
+        "Median count exchange",
+        "Final aggregation",
+        "Median value exchange"
+    };
 
     // init mpi first so any fatal validation can fail collectively
     MPI_Init(&argc, &argv);
@@ -44,6 +56,11 @@ int main(int argc, char* argv[]) {
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
     std::string directoryPath = argv[1];
+    const auto pipelineStart = Clock::now();
+    std::array<double, timingPartCount> localTimings = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    auto elapsedSeconds = [](const Clock::time_point& start, const Clock::time_point& end) {
+        return std::chrono::duration<double>(end - start).count();
+    };
     // check if the provided path is a valid directory
     if (!std::filesystem::is_directory(directoryPath)) {
         std::cerr << "Rank " << rank << " error: " << directoryPath << " is not a valid directory." << std::endl;
@@ -663,7 +680,8 @@ int main(int argc, char* argv[]) {
                 printHeapEntries("Bottom 10 " + label + "s:", metric.bottom);
             };
 
-            out << "Total files processed: " << totalCount << std::endl;
+            out << "Stats:" << std::endl;
+            out << "Total files processed (rows processed): " << totalCount << std::endl;
             printMetricSummary("line count", line);
             printMetricSummary("word count", word);
             printMetricSummary("character count", character);
@@ -676,6 +694,8 @@ int main(int argc, char* argv[]) {
     TotalType nodeRowsParsed = 0;
     TotalType nodeRowsSkipped = 0;
     logProgress("Starting local file processing.", true);
+
+    const auto localProcessingStart = Clock::now();
 
     // use openmp to parallelize the processing of files for this node
     #pragma omp parallel
@@ -730,10 +750,12 @@ int main(int argc, char* argv[]) {
             nodeRowsSkipped += threadRowsSkipped;
         }
     }
+    localTimings[0] = elapsedSeconds(localProcessingStart, Clock::now());
     logProgress("Completed local file processing.", true);
 
     std::array<TotalType, 3> nodeParseCounters = {nodeRowsSeen, nodeRowsParsed, nodeRowsSkipped};
     std::array<TotalType, 3> globalParseCounters = {0, 0, 0};
+    const auto parseReduceStart = Clock::now();
     MPI_Reduce(
         nodeParseCounters.data(),
         globalParseCounters.data(),
@@ -743,15 +765,19 @@ int main(int argc, char* argv[]) {
         0,
         MPI_COMM_WORLD
     );
+    localTimings[1] = elapsedSeconds(parseReduceStart, Clock::now());
 
     const TotalType localFileTotal = nodeResults.packStats()[0];
     TotalType globalFileTotal = 0;
+    const auto globalTotalReduceStart = Clock::now();
     MPI_Allreduce(&localFileTotal, &globalFileTotal, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    localTimings[2] = elapsedSeconds(globalTotalReduceStart, Clock::now());
 
     constexpr std::array<int, 3> medianOwners = {1, 2, 3};
     constexpr int medianCountsTagBase = 200;
     constexpr int medianValueTagBase = 260;
 
+    const auto medianCountExchangeStart = Clock::now();
     for (int metricIndex = 0; metricIndex < 3; ++metricIndex) {
         const int ownerRank = medianOwners[static_cast<std::size_t>(metricIndex)];
         const int countTagBase = medianCountsTagBase + metricIndex * 10;
@@ -768,9 +794,11 @@ int main(int argc, char* argv[]) {
             nodeResults.sendMetricCountsToRank(metricIndex, ownerRank, countTagBase);
         }
     }
+    localTimings[3] = elapsedSeconds(medianCountExchangeStart, Clock::now());
 
     // gather the non-median summary data to rank 0 and merge it into a final results object
     Results finalResults;
+    const auto finalAggregationStart = Clock::now();
     if (rank == 0) {
         logProgress("Starting final aggregation on rank 0.");
         finalResults.mergeSummaryFrom(nodeResults);
@@ -784,9 +812,11 @@ int main(int argc, char* argv[]) {
     } else if (rank > 0) {
         nodeResults.sendSummaryToRank(0, 100, 140);
     }
+    localTimings[4] = elapsedSeconds(finalAggregationStart, Clock::now());
 
     MPI_Barrier(MPI_COMM_WORLD);
 
+    const auto medianValueExchangeStart = Clock::now();
     if (rank == 0) {
         for (int metricIndex = 0; metricIndex < 3; ++metricIndex) {
             finalResults.recvMedianFromRank(metricIndex, medianOwners[static_cast<std::size_t>(metricIndex)], medianValueTagBase + metricIndex * 10);
@@ -795,6 +825,25 @@ int main(int argc, char* argv[]) {
         const int metricIndex = rank - 1;
         nodeResults.sendMedianToRank(0, metricIndex, medianValueTagBase + metricIndex * 10);
     }
+    localTimings[5] = elapsedSeconds(medianValueExchangeStart, Clock::now());
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    localTimings[6] = elapsedSeconds(pipelineStart, Clock::now());
+
+    std::vector<double> gatheredTimings;
+    if (rank == 0) {
+        gatheredTimings.resize(static_cast<std::size_t>(size) * timingPartCount, 0.0);
+    }
+    MPI_Gather(
+        localTimings.data(),
+        static_cast<int>(timingPartCount),
+        MPI_DOUBLE,
+        rank == 0 ? gatheredTimings.data() : nullptr,
+        static_cast<int>(timingPartCount),
+        MPI_DOUBLE,
+        0,
+        MPI_COMM_WORLD
+    );
 
     // finalize mpi
     MPI_Finalize();
@@ -805,6 +854,29 @@ int main(int argc, char* argv[]) {
         std::cout << "rows_seen: " << globalParseCounters[0] << std::endl;
         std::cout << "rows_parsed: " << globalParseCounters[1] << std::endl;
         std::cout << "rows_skipped: " << globalParseCounters[2] << std::endl;
+
+        std::cout << "Timing summary:" << std::endl;
+        std::array<double, timingPartCount - 1> stageTotals = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        for (int node = 0; node < size; ++node) {
+            const std::size_t baseIndex = static_cast<std::size_t>(node) * timingPartCount;
+            for (std::size_t stage = 0; stage + 1 < timingPartCount; ++stage) {
+                stageTotals[stage] += gatheredTimings[baseIndex + stage];
+            }
+        }
+
+        for (std::size_t stage = 0; stage + 1 < timingPartCount; ++stage) {
+            const double stageAverage = stageTotals[stage] / static_cast<double>(size);
+            std::cout << timingLabels[stage] << " total: " << std::fixed << std::setprecision(6)
+                      << stageTotals[stage] << " s"
+                      << " (avg per node: " << stageAverage << " s)" << std::endl;
+        }
+
+        std::cout << "Node times:" << std::endl;
+        for (int node = 0; node < size; ++node) {
+            const std::size_t baseIndex = static_cast<std::size_t>(node) * timingPartCount;
+            std::cout << "Node " << node << " total: " << std::fixed << std::setprecision(6)
+                      << gatheredTimings[baseIndex + timingPartCount - 1] << " s" << std::endl;
+        }
     }
 
     return 0;
