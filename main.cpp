@@ -25,6 +25,12 @@ int main(int argc, char* argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+    auto logProgress = [rank](const std::string& message, bool allRanks = false) {
+        if (allRanks || rank == 0) {
+            std::cout << "[progress][rank " << rank << "] " << message << std::endl;
+        }
+    };
+
     // args: directory path and expected node count
     if (argc < 3) {
         if (rank == 0) {
@@ -83,6 +89,7 @@ int main(int argc, char* argv[]) {
         }
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
+    logProgress("Validated MPI world size and input arguments.");
 
     // using rank, get the range of files to process for this node
     int start = nodeRanges[static_cast<std::size_t>(rank)].first;
@@ -388,6 +395,7 @@ int main(int argc, char* argv[]) {
 
     // create a results object for this node
     Results nodeResults;
+    logProgress("Starting local file processing.", true);
 
     // use openmp to parallelize the processing of files for this node
     #pragma omp parallel
@@ -433,6 +441,7 @@ int main(int argc, char* argv[]) {
             nodeResults.mergeFrom(threadResults);
         }
     }
+    logProgress("Completed local file processing.", true);
 
     // define median variable for each node to store the median values for line count, word count, and char count
     MedianValue medianLineCount;
@@ -469,21 +478,19 @@ int main(int argc, char* argv[]) {
         return -1; // should never reach here
     };
 
-    auto computeMedianValues = [&quickSelect](const std::vector<int>& values) -> MedianValue {
+    auto computeMedianValues = [&quickSelect](std::vector<int>& values) -> MedianValue {
         MedianValue median;
         if (values.empty()) {
             return median;
         }
 
-        std::vector<int> upperValues = values;
-        int upperIndex = static_cast<int>(upperValues.size() / 2);
-        median.upperMiddle = quickSelect(upperValues, upperIndex);
+        int upperIndex = static_cast<int>(values.size() / 2);
+        median.upperMiddle = quickSelect(values, upperIndex);
 
         if (values.size() % 2 == 1) {
             median.arithmetic = static_cast<double>(median.upperMiddle);
         } else {
-            std::vector<int> lowerValues = values;
-            int lowerMiddle = quickSelect(lowerValues, upperIndex - 1);
+            int lowerMiddle = quickSelect(values, upperIndex - 1);
             median.arithmetic = (static_cast<double>(lowerMiddle) + static_cast<double>(median.upperMiddle)) / 2.0;
         }
 
@@ -540,6 +547,7 @@ int main(int argc, char* argv[]) {
     };
 
     // Gather each metric to its designated reducer rank.
+    logProgress("Gathering raw metric counts for median reducers.");
     std::vector<int> allLineCounts = gatherValuesToReducer(nodeResults.lineCounts(), 1);
     std::vector<int> allWordCounts = gatherValuesToReducer(nodeResults.wordCounts(), 2);
     std::vector<int> allCharCounts = gatherValuesToReducer(nodeResults.charCounts(), 3);
@@ -549,12 +557,18 @@ int main(int argc, char* argv[]) {
 
     if (rank == 1 && !allLineCounts.empty()) {
         medianLineCount = computeMedianValues(allLineCounts);
+        allLineCounts.clear();
+        allLineCounts.shrink_to_fit();
     }
     if (rank == 2 && !allWordCounts.empty()) {
         medianWordCount = computeMedianValues(allWordCounts);
+        allWordCounts.clear();
+        allWordCounts.shrink_to_fit();
     }
     if (rank == 3 && !allCharCounts.empty()) {
         medianCharCount = computeMedianValues(allCharCounts);
+        allCharCounts.clear();
+        allCharCounts.shrink_to_fit();
     }
 
     auto broadcastMedian = [](MedianValue& median, int reducerRank) {
@@ -566,6 +580,7 @@ int main(int argc, char* argv[]) {
     broadcastMedian(medianLineCount, 1);
     broadcastMedian(medianWordCount, 2);
     broadcastMedian(medianCharCount, 3);
+    logProgress("Median values computed and broadcast to all ranks.");
 
     if (rank == 1) {
         std::cout << "Median line count (upper-middle): " << medianLineCount.upperMiddle
@@ -586,6 +601,7 @@ int main(int argc, char* argv[]) {
     // gather each node results to rank 0 and merge them into a final results object
     Results finalResults;
     if (rank == 0) {
+        logProgress("Starting final aggregation on rank 0.");
         finalResults.mergeFrom(nodeResults);
         for (int i = 1; i < size; ++i) {
             Results recvResults;
@@ -593,6 +609,7 @@ int main(int argc, char* argv[]) {
             recvResults.recvFromRank(i, 100, 101, 110);
             finalResults.mergeFrom(recvResults);
         }
+        logProgress("Final aggregation complete.");
     } else {
         nodeResults.sendToRank(0, 100, 101, 110);
     }
