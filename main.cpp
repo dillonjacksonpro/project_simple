@@ -25,12 +25,13 @@ using Clock = std::chrono::steady_clock;
 
 int main(int argc, char* argv[]) {
     constexpr int expectedRanks = 16;
-    constexpr std::size_t timingPartCount = 7;
+    constexpr std::size_t timingPartCount = 8;
     constexpr std::array<const char*, timingPartCount - 1> timingLabels = {
         "Local file processing",
         "Row counter reduction",
         "File total reduction",
         "Median count exchange",
+        "Median calculation",
         "Final aggregation",
         "Median value exchange"
     };
@@ -57,7 +58,7 @@ int main(int argc, char* argv[]) {
     }
     std::string directoryPath = argv[1];
     const auto pipelineStart = Clock::now();
-    std::array<double, timingPartCount> localTimings = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    std::array<double, timingPartCount> localTimings = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     auto elapsedSeconds = [](const Clock::time_point& start, const Clock::time_point& end) {
         return std::chrono::duration<double>(end - start).count();
     };
@@ -112,9 +113,6 @@ int main(int argc, char* argv[]) {
     const int localFileCount = baseFilesPerRank + (rank < extraFiles ? 1 : 0);
     const int end = start + localFileCount;
     std::cout << "Node " << rank << " processing files from index " << start << " to " << end - 1 << std::endl;
-
-    // define a high performance simple heap to keep track of the top/bottom 10 values for line count, word count, and character count
-    // this heap should be able to efficiently maintain the top/bottom 10 values as new values are added
 
     class BoundedHeap {
     private:
@@ -181,13 +179,7 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    // define a node unordered map to store results
-    // map needs a field for:
-    // total count - only a single value
-    // line count, word count, character count
-    // each of those fields needs a vector for raw values, a running total, an average, and a top/bottom 10 simple heap
-    // add median to the results struct as well, but we will calculate it later after we have all the raw values
-
+    
     struct MedianValue {
         CountType upperMiddle;
         double arithmetic;
@@ -796,6 +788,15 @@ int main(int argc, char* argv[]) {
     }
     localTimings[3] = elapsedSeconds(medianCountExchangeStart, Clock::now());
 
+    const auto medianCalculationStart = Clock::now();
+    for (int metricIndex = 0; metricIndex < 3; ++metricIndex) {
+        const int ownerRank = medianOwners[static_cast<std::size_t>(metricIndex)];
+        if (rank == ownerRank) {
+            nodeResults.computeMedianForMetric(metricIndex, globalFileTotal);
+        }
+    }
+    localTimings[4] = elapsedSeconds(medianCalculationStart, Clock::now());
+
     // gather the non-median summary data to rank 0 and merge it into a final results object
     Results finalResults;
     const auto finalAggregationStart = Clock::now();
@@ -812,7 +813,7 @@ int main(int argc, char* argv[]) {
     } else if (rank > 0) {
         nodeResults.sendSummaryToRank(0, 100, 140);
     }
-    localTimings[4] = elapsedSeconds(finalAggregationStart, Clock::now());
+    localTimings[5] = elapsedSeconds(finalAggregationStart, Clock::now());
 
     MPI_Barrier(MPI_COMM_WORLD);
 
@@ -825,10 +826,10 @@ int main(int argc, char* argv[]) {
         const int metricIndex = rank - 1;
         nodeResults.sendMedianToRank(0, metricIndex, medianValueTagBase + metricIndex * 10);
     }
-    localTimings[5] = elapsedSeconds(medianValueExchangeStart, Clock::now());
+    localTimings[6] = elapsedSeconds(medianValueExchangeStart, Clock::now());
 
     MPI_Barrier(MPI_COMM_WORLD);
-    localTimings[6] = elapsedSeconds(pipelineStart, Clock::now());
+    localTimings[7] = elapsedSeconds(pipelineStart, Clock::now());
 
     std::vector<double> gatheredTimings;
     if (rank == 0) {
@@ -856,7 +857,7 @@ int main(int argc, char* argv[]) {
         std::cout << "rows_skipped: " << globalParseCounters[2] << std::endl;
 
         std::cout << "Timing summary:" << std::endl;
-        std::array<double, timingPartCount - 1> stageTotals = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        std::array<double, timingPartCount - 1> stageTotals = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
         for (int node = 0; node < size; ++node) {
             const std::size_t baseIndex = static_cast<std::size_t>(node) * timingPartCount;
             for (std::size_t stage = 0; stage + 1 < timingPartCount; ++stage) {
@@ -870,6 +871,14 @@ int main(int argc, char* argv[]) {
                       << stageTotals[stage] << " s"
                       << " (avg per node: " << stageAverage << " s)" << std::endl;
         }
+
+        double endToEndTotal = 0.0;
+        for (int node = 0; node < size; ++node) {
+            const std::size_t baseIndex = static_cast<std::size_t>(node) * timingPartCount;
+            endToEndTotal = std::max(endToEndTotal, gatheredTimings[baseIndex + timingPartCount - 1]);
+        }
+        std::cout << "End-to-end total: " << std::fixed << std::setprecision(6)
+                  << endToEndTotal << " s (max node time)" << std::endl;
 
         std::cout << "Node times:" << std::endl;
         for (int node = 0; node < size; ++node) {
