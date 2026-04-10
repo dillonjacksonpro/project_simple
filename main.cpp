@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #ifndef OMPI_SKIP_MPICXX
 #define OMPI_SKIP_MPICXX 1
 #endif
@@ -16,10 +17,11 @@
 #include <omp.h>
 
 using CountType = unsigned int;
+using TotalType = std::uint64_t;
 
 
 int main(int argc, char* argv[]) {
-    constexpr int expectedRanks = 4;
+    constexpr int expectedRanks = 16;
 
     // init mpi first so any fatal validation can fail collectively
     MPI_Init(&argc, &argv);
@@ -76,15 +78,6 @@ int main(int argc, char* argv[]) {
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    // split the file names into ranges for each node
-    std::vector<std::pair<int, int>> nodeRanges;
-    int filesPerNode = static_cast<int>(fileNames.size() / static_cast<std::size_t>(numNodes));
-    for (int i = 0; i < numNodes; ++i) {
-        int start = i * filesPerNode;
-        int end = (i == numNodes - 1) ? static_cast<int>(fileNames.size()) : (i + 1) * filesPerNode;
-        nodeRanges.emplace_back(start, end);
-    }
-
     if (size != expectedRanks || numNodes != expectedRanks || size != numNodes) {
         if (rank == 0) {
             std::cerr << "Error: this program expects exactly " << expectedRanks
@@ -94,9 +87,13 @@ int main(int argc, char* argv[]) {
     }
     logProgress("Validated MPI world size and input arguments.");
 
-    // using rank, get the range of files to process for this node
-    int start = nodeRanges[static_cast<std::size_t>(rank)].first;
-    int end = nodeRanges[static_cast<std::size_t>(rank)].second;
+    // split work with quotient/remainder so every file is assigned exactly once
+    const int totalFiles = static_cast<int>(fileNames.size());
+    const int baseFilesPerRank = totalFiles / numNodes;
+    const int extraFiles = totalFiles % numNodes;
+    const int start = rank * baseFilesPerRank + std::min(rank, extraFiles);
+    const int localFileCount = baseFilesPerRank + (rank < extraFiles ? 1 : 0);
+    const int end = start + localFileCount;
     std::cout << "Node " << rank << " processing files from index " << start << " to " << end - 1 << std::endl;
 
     // define a high performance simple heap to keep track of the top/bottom 10 values for line count, word count, and character count
@@ -187,7 +184,7 @@ int main(int argc, char* argv[]) {
 
         struct MetricData {
             std::vector<CountEntry> valueCounts;
-            CountType total;
+            TotalType total;
             double average;
             BoundedHeap top;
             BoundedHeap bottom;
@@ -200,11 +197,108 @@ int main(int argc, char* argv[]) {
                   bottom(10, false) {}
         };
 
-        CountType totalCount;
+        TotalType totalCount;
         MetricData line;
         MetricData word;
         MetricData character;
 
+        static bool parseNonNegativeCount(const std::string& field, CountType& value) {
+            try {
+                std::size_t parsed = 0;
+                long long signedValue = std::stoll(field, &parsed, 10);
+                if (parsed != field.size()) {
+                    return false;
+                }
+
+                if (signedValue < 0) {
+                    value = 0;
+                    return true;
+                }
+
+                const auto maxCount = static_cast<long long>(std::numeric_limits<CountType>::max());
+                value = static_cast<CountType>(signedValue > maxCount ? maxCount : signedValue);
+                return true;
+            } catch (const std::exception&) {
+                return false;
+            }
+        }
+
+    public:
+        static bool parseCsvLine(
+            const std::string& rawLine,
+            std::string& name,
+            CountType& bytes,
+            CountType& words,
+            CountType& lines
+        ) {
+            if (rawLine.empty()) {
+                return false;
+            }
+
+            auto trim = [](const std::string& value) -> std::string {
+                std::size_t first = value.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos) {
+                    return std::string();
+                }
+                std::size_t last = value.find_last_not_of(" \t\r\n");
+                return value.substr(first, last - first + 1);
+            };
+
+            // Find the final 3 delimiters from the right. This keeps names intact even when they contain commas.
+            std::array<std::size_t, 3> delimiterPos = {std::string::npos, std::string::npos, std::string::npos};
+            int foundDelimiters = 0;
+            bool inQuotes = false;
+
+            for (std::size_t idx = rawLine.size(); idx > 0; --idx) {
+                const char current = rawLine[idx - 1];
+                if (current == '"') {
+                    inQuotes = !inQuotes;
+                    continue;
+                }
+                if (!inQuotes && current == ',') {
+                    delimiterPos[static_cast<std::size_t>(2 - foundDelimiters)] = idx - 1;
+                    ++foundDelimiters;
+                    if (foundDelimiters == 3) {
+                        break;
+                    }
+                }
+            }
+
+            if (foundDelimiters != 3) {
+                return false;
+            }
+
+            name = trim(rawLine.substr(0, delimiterPos[0]));
+
+            std::array<std::string, 3> numericFields;
+            numericFields[0] = trim(rawLine.substr(delimiterPos[0] + 1, delimiterPos[1] - delimiterPos[0] - 1));
+            numericFields[1] = trim(rawLine.substr(delimiterPos[1] + 1, delimiterPos[2] - delimiterPos[1] - 1));
+            numericFields[2] = trim(rawLine.substr(delimiterPos[2] + 1));
+
+            if (name.empty() || numericFields[0].empty() || numericFields[1].empty() || numericFields[2].empty()) {
+                return false;
+            }
+
+            if (name.front() == '"' && name.back() == '"' && name.size() >= 2) {
+                std::string unescaped;
+                unescaped.reserve(name.size() - 2);
+                for (std::size_t idx = 1; idx + 1 < name.size(); ++idx) {
+                    if (name[idx] == '"' && idx + 1 < name.size() - 1 && name[idx + 1] == '"') {
+                        unescaped.push_back('"');
+                        ++idx;
+                    } else {
+                        unescaped.push_back(name[idx]);
+                    }
+                }
+                name.swap(unescaped);
+            }
+
+            return parseNonNegativeCount(numericFields[0], bytes)
+                && parseNonNegativeCount(numericFields[1], words)
+                && parseNonNegativeCount(numericFields[2], lines);
+        }
+
+    private:
         static void mergeHeaps(BoundedHeap& target, const BoundedHeap& source) {
             for (const auto& entry : source.entries()) {
                 target.add(entry.first, entry.second);
@@ -258,34 +352,38 @@ int main(int argc, char* argv[]) {
             target.swap(merged);
         }
 
-        static void addMetric(const std::string& fileName, CountType value, CountType currentTotalCount, MetricData& metric) {
+        static void addMetric(const std::string& fileName, CountType value, TotalType currentTotalCount, MetricData& metric) {
             insertCount(metric.valueCounts, value);
             metric.total += value;
-            metric.average = currentTotalCount > 0 ? static_cast<double>(metric.total) / currentTotalCount : 0.0;
+            metric.average = currentTotalCount > 0
+                ? static_cast<double>(metric.total) / static_cast<double>(currentTotalCount)
+                : 0.0;
             metric.top.add(fileName, value);
             metric.bottom.add(fileName, value);
         }
 
-        static void recomputeAverages(CountType currentTotalCount, MetricData& metric) {
-            metric.average = currentTotalCount > 0 ? static_cast<double>(metric.total) / currentTotalCount : 0.0;
+        static void recomputeAverages(TotalType currentTotalCount, MetricData& metric) {
+            metric.average = currentTotalCount > 0
+                ? static_cast<double>(metric.total) / static_cast<double>(currentTotalCount)
+                : 0.0;
         }
 
-        static MedianValue computeMedianFromCounts(const std::vector<CountEntry>& counts, CountType sampleCount) {
+        static MedianValue computeMedianFromCounts(const std::vector<CountEntry>& counts, TotalType sampleCount) {
             MedianValue median;
             if (sampleCount == 0 || counts.empty()) {
                 return median;
             }
 
-            const CountType lowerIndex = (sampleCount - 1) / 2;
-            const CountType upperIndex = sampleCount / 2;
-            CountType runningIndex = 0;
+            const TotalType lowerIndex = (sampleCount - 1) / 2;
+            const TotalType upperIndex = sampleCount / 2;
+            TotalType runningIndex = 0;
             CountType lowerMiddle = 0;
             CountType upperMiddle = 0;
             bool lowerFound = false;
             bool upperFound = false;
 
             for (const auto& [value, frequency] : counts) {
-                const CountType nextIndex = runningIndex + frequency - 1;
+                const TotalType nextIndex = runningIndex + frequency - 1;
                 if (!lowerFound && lowerIndex >= runningIndex && lowerIndex <= nextIndex) {
                     lowerMiddle = value;
                     lowerFound = true;
@@ -390,7 +488,7 @@ int main(int argc, char* argv[]) {
             character.median = computeMedianFromCounts(character.valueCounts, totalCount);
         }
 
-        std::array<CountType, 4> packStats() const {
+        std::array<TotalType, 4> packStats() const {
             return {
                 totalCount,
                 line.total,
@@ -399,7 +497,7 @@ int main(int argc, char* argv[]) {
             };
         }
 
-        void unpackStats(const std::array<CountType, 4>& packedStats) {
+        void unpackStats(const std::array<TotalType, 4>& packedStats) {
             totalCount = packedStats[0];
             line.total = packedStats[1];
             word.total = packedStats[2];
@@ -412,7 +510,7 @@ int main(int argc, char* argv[]) {
 
         void sendToRank(int dest, int statsTag, int countsBaseTag, int heapBaseTag) const {
             const auto packedStats = packStats();
-            MPI_Send(packedStats.data(), static_cast<int>(packedStats.size()), MPI_UNSIGNED, dest, statsTag, MPI_COMM_WORLD);
+            MPI_Send(packedStats.data(), static_cast<int>(packedStats.size()), MPI_UINT64_T, dest, statsTag, MPI_COMM_WORLD);
 
             sendCountMap(line.valueCounts, dest, countsBaseTag);
             sendCountMap(word.valueCounts, dest, countsBaseTag + 10);
@@ -427,9 +525,9 @@ int main(int argc, char* argv[]) {
         }
 
         void recvFromRank(int src, int statsTag, int countsBaseTag, int heapBaseTag) {
-            std::array<CountType, 4> packedStats = {0, 0, 0, 0};
+            std::array<TotalType, 4> packedStats = {0, 0, 0, 0};
 
-            MPI_Recv(packedStats.data(), static_cast<int>(packedStats.size()), MPI_UNSIGNED, src, statsTag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(packedStats.data(), static_cast<int>(packedStats.size()), MPI_UINT64_T, src, statsTag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             unpackStats(packedStats);
 
             recvCountMap(line.valueCounts, src, countsBaseTag);
@@ -470,12 +568,18 @@ int main(int argc, char* argv[]) {
 
     // create a results object for this node
     Results nodeResults;
+    TotalType nodeRowsSeen = 0;
+    TotalType nodeRowsParsed = 0;
+    TotalType nodeRowsSkipped = 0;
     logProgress("Starting local file processing.", true);
 
     // use openmp to parallelize the processing of files for this node
     #pragma omp parallel
     {
         Results threadResults;
+        TotalType threadRowsSeen = 0;
+        TotalType threadRowsParsed = 0;
+        TotalType threadRowsSkipped = 0;
 
         #pragma omp for nowait
         for (int i = start; i < end; ++i) {
@@ -498,13 +602,16 @@ int main(int argc, char* argv[]) {
             // name, bytes, words, lines
             // we need to parse the line to get the counts
             while (std::getline(file, line)) {
-                std::istringstream ss(line);
+                ++threadRowsSeen;
                 std::string name;
                 CountType bytes = 0;
                 CountType words = 0;
                 CountType lines = 0;
-                if (std::getline(ss, name, ',') && ss >> bytes && ss.ignore() && ss >> words && ss.ignore() && ss >> lines) {
+                if (Results::parseCsvLine(line, name, bytes, words, lines)) {
                     threadResults.addFileResult(name, lines, words, bytes);
+                    ++threadRowsParsed;
+                } else {
+                    ++threadRowsSkipped;
                 }
             }
             file.close();
@@ -514,9 +621,24 @@ int main(int argc, char* argv[]) {
         #pragma omp critical
         {
             nodeResults.mergeFrom(threadResults);
+            nodeRowsSeen += threadRowsSeen;
+            nodeRowsParsed += threadRowsParsed;
+            nodeRowsSkipped += threadRowsSkipped;
         }
     }
     logProgress("Completed local file processing.", true);
+
+    std::array<TotalType, 3> nodeParseCounters = {nodeRowsSeen, nodeRowsParsed, nodeRowsSkipped};
+    std::array<TotalType, 3> globalParseCounters = {0, 0, 0};
+    MPI_Reduce(
+        nodeParseCounters.data(),
+        globalParseCounters.data(),
+        static_cast<int>(nodeParseCounters.size()),
+        MPI_UINT64_T,
+        MPI_SUM,
+        0,
+        MPI_COMM_WORLD
+    );
 
     // gather each node results to rank 0 and merge them into a final results object
     Results finalResults;
@@ -541,6 +663,9 @@ int main(int argc, char* argv[]) {
     // output final results only on rank 0
     if (rank == 0) {
         finalResults.printSummary(std::cout);
+        std::cout << "rows_seen: " << globalParseCounters[0] << std::endl;
+        std::cout << "rows_parsed: " << globalParseCounters[1] << std::endl;
+        std::cout << "rows_skipped: " << globalParseCounters[2] << std::endl;
     }
 
     return 0;
