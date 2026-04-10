@@ -33,5 +33,10 @@ fi
 # Keep OpenMP deterministic by default; users can override OMP_NUM_THREADS.
 OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
-# Launch step with a clean exported environment to avoid inherited SLURM_MEM_PER_* conflicts.
-srun --export=NONE,OMP_NUM_THREADS="$OMP_NUM_THREADS" "$EXECUTABLE" "$INPUT_DIR" "$NUM_NODES"
+# Launch step with a clean exported environment and scrub conflicting mem vars
+# from the srun process itself.
+env \
+    -u SLURM_MEM_PER_CPU \
+    -u SLURM_MEM_PER_GPU \
+    -u SLURM_MEM_PER_NODE \
+    srun --export=NONE,OMP_NUM_THREADS="$OMP_NUM_THREADS" "$EXECUTABLE" "$INPUT_DIR" "$NUM_NODES"
