@@ -8,11 +8,14 @@
 #include <string>
 #include <filesystem>
 #include <algorithm>
+#include <cstdint>
 #ifndef OMPI_SKIP_MPICXX
 #define OMPI_SKIP_MPICXX 1
 #endif
 #include <mpi.h>
 #include <omp.h>
+
+using CountType = unsigned int;
 
 
 int main(int argc, char* argv[]) {
@@ -101,7 +104,7 @@ int main(int argc, char* argv[]) {
 
     class BoundedHeap {
     private:
-        using Entry = std::pair<std::string, int>;
+        using Entry = std::pair<std::string, CountType>;
         using CompareFn = bool (*)(const Entry&, const Entry&);
 
         std::vector<Entry> heap;
@@ -117,7 +120,7 @@ int main(int argc, char* argv[]) {
             return lhs.second < rhs.second;
         }
 
-        bool shouldReplace(int incoming) const {
+        bool shouldReplace(CountType incoming) const {
             return keepLargest ? (incoming > heap.front().second) : (incoming < heap.front().second);
         }
 
@@ -129,7 +132,7 @@ int main(int argc, char* argv[]) {
             heap.reserve(capacity);
         }
 
-        void add(const std::string& fileName, int count) {
+        void add(const std::string& fileName, CountType count) {
             if (heap.size() < capacity) {
                 heap.emplace_back(fileName, count);
                 std::push_heap(heap.begin(), heap.end(), compare);
@@ -172,7 +175,7 @@ int main(int argc, char* argv[]) {
     // add median to the results struct as well, but we will calculate it later after we have all the raw values
 
     struct MedianValue {
-        int upperMiddle;
+        CountType upperMiddle;
         double arithmetic;
 
         MedianValue() : upperMiddle(0), arithmetic(0.0) {}
@@ -180,11 +183,11 @@ int main(int argc, char* argv[]) {
 
     class Results {
     private:
-        using CountEntry = std::pair<int, int>;
+        using CountEntry = std::pair<CountType, CountType>;
 
         struct MetricData {
             std::vector<CountEntry> valueCounts;
-            int total;
+            CountType total;
             double average;
             BoundedHeap top;
             BoundedHeap bottom;
@@ -197,7 +200,7 @@ int main(int argc, char* argv[]) {
                   bottom(10, false) {}
         };
 
-        int totalCount;
+        CountType totalCount;
         MetricData line;
         MetricData word;
         MetricData character;
@@ -208,12 +211,12 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        static void insertCount(std::vector<CountEntry>& counts, int value, int frequency = 1) {
+        static void insertCount(std::vector<CountEntry>& counts, CountType value, CountType frequency = 1) {
             auto position = std::lower_bound(
                 counts.begin(),
                 counts.end(),
                 value,
-                [](const CountEntry& entry, int candidateValue) {
+                [](const CountEntry& entry, CountType candidateValue) {
                     return entry.first < candidateValue;
                 }
             );
@@ -255,7 +258,7 @@ int main(int argc, char* argv[]) {
             target.swap(merged);
         }
 
-        static void addMetric(const std::string& fileName, int value, int currentTotalCount, MetricData& metric) {
+        static void addMetric(const std::string& fileName, CountType value, CountType currentTotalCount, MetricData& metric) {
             insertCount(metric.valueCounts, value);
             metric.total += value;
             metric.average = currentTotalCount > 0 ? static_cast<double>(metric.total) / currentTotalCount : 0.0;
@@ -263,26 +266,26 @@ int main(int argc, char* argv[]) {
             metric.bottom.add(fileName, value);
         }
 
-        static void recomputeAverages(int currentTotalCount, MetricData& metric) {
+        static void recomputeAverages(CountType currentTotalCount, MetricData& metric) {
             metric.average = currentTotalCount > 0 ? static_cast<double>(metric.total) / currentTotalCount : 0.0;
         }
 
-        static MedianValue computeMedianFromCounts(const std::vector<CountEntry>& counts, int sampleCount) {
+        static MedianValue computeMedianFromCounts(const std::vector<CountEntry>& counts, CountType sampleCount) {
             MedianValue median;
-            if (sampleCount <= 0 || counts.empty()) {
+            if (sampleCount == 0 || counts.empty()) {
                 return median;
             }
 
-            const int lowerIndex = (sampleCount - 1) / 2;
-            const int upperIndex = sampleCount / 2;
-            int runningIndex = 0;
-            int lowerMiddle = 0;
-            int upperMiddle = 0;
+            const CountType lowerIndex = (sampleCount - 1) / 2;
+            const CountType upperIndex = sampleCount / 2;
+            CountType runningIndex = 0;
+            CountType lowerMiddle = 0;
+            CountType upperMiddle = 0;
             bool lowerFound = false;
             bool upperFound = false;
 
             for (const auto& [value, frequency] : counts) {
-                const int nextIndex = runningIndex + frequency - 1;
+                const CountType nextIndex = runningIndex + frequency - 1;
                 if (!lowerFound && lowerIndex >= runningIndex && lowerIndex <= nextIndex) {
                     lowerMiddle = value;
                     lowerFound = true;
@@ -308,8 +311,8 @@ int main(int argc, char* argv[]) {
             int entryCount = static_cast<int>(counts.size());
             MPI_Send(&entryCount, 1, MPI_INT, dest, baseTag, MPI_COMM_WORLD);
             for (const auto& [value, frequency] : counts) {
-                const std::array<int, 2> entry = {value, frequency};
-                MPI_Send(entry.data(), static_cast<int>(entry.size()), MPI_INT, dest, baseTag + 1, MPI_COMM_WORLD);
+                const std::array<CountType, 2> entry = {value, frequency};
+                MPI_Send(entry.data(), static_cast<int>(entry.size()), MPI_UNSIGNED, dest, baseTag + 1, MPI_COMM_WORLD);
             }
         }
 
@@ -317,8 +320,8 @@ int main(int argc, char* argv[]) {
             int entryCount = 0;
             MPI_Recv(&entryCount, 1, MPI_INT, src, baseTag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             for (int idx = 0; idx < entryCount; ++idx) {
-                std::array<int, 2> entry = {0, 0};
-                MPI_Recv(entry.data(), static_cast<int>(entry.size()), MPI_INT, src, baseTag + 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                std::array<CountType, 2> entry = {0, 0};
+                MPI_Recv(entry.data(), static_cast<int>(entry.size()), MPI_UNSIGNED, src, baseTag + 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 insertCount(counts, entry[0], entry[1]);
             }
         }
@@ -330,7 +333,7 @@ int main(int argc, char* argv[]) {
                 int fileNameLength = static_cast<int>(entry.first.size());
                 MPI_Send(&fileNameLength, 1, MPI_INT, dest, baseTag + 1, MPI_COMM_WORLD);
                 MPI_Send(entry.first.data(), fileNameLength, MPI_CHAR, dest, baseTag + 2, MPI_COMM_WORLD);
-                MPI_Send(&entry.second, 1, MPI_INT, dest, baseTag + 3, MPI_COMM_WORLD);
+                MPI_Send(&entry.second, 1, MPI_UNSIGNED, dest, baseTag + 3, MPI_COMM_WORLD);
             }
         }
 
@@ -342,8 +345,8 @@ int main(int argc, char* argv[]) {
                 MPI_Recv(&fileNameLength, 1, MPI_INT, src, baseTag + 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 std::string fileName(static_cast<size_t>(fileNameLength), '\0');
                 MPI_Recv(fileName.data(), fileNameLength, MPI_CHAR, src, baseTag + 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                int count = 0;
-                MPI_Recv(&count, 1, MPI_INT, src, baseTag + 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                CountType count = 0;
+                MPI_Recv(&count, 1, MPI_UNSIGNED, src, baseTag + 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 heapObj.add(fileName, count);
             }
         }
@@ -351,7 +354,7 @@ int main(int argc, char* argv[]) {
     public:
         Results() : totalCount(0) {}
 
-        void addFileResult(const std::string& fileName, int lineCount, int wordCount, int charCount) {
+        void addFileResult(const std::string& fileName, CountType lineCount, CountType wordCount, CountType charCount) {
             ++totalCount;
             addMetric(fileName, lineCount, totalCount, line);
             addMetric(fileName, wordCount, totalCount, word);
@@ -387,7 +390,7 @@ int main(int argc, char* argv[]) {
             character.median = computeMedianFromCounts(character.valueCounts, totalCount);
         }
 
-        std::array<int, 4> packStats() const {
+        std::array<CountType, 4> packStats() const {
             return {
                 totalCount,
                 line.total,
@@ -396,7 +399,7 @@ int main(int argc, char* argv[]) {
             };
         }
 
-        void unpackStats(const std::array<int, 4>& packedStats) {
+        void unpackStats(const std::array<CountType, 4>& packedStats) {
             totalCount = packedStats[0];
             line.total = packedStats[1];
             word.total = packedStats[2];
@@ -409,7 +412,7 @@ int main(int argc, char* argv[]) {
 
         void sendToRank(int dest, int statsTag, int countsBaseTag, int heapBaseTag) const {
             const auto packedStats = packStats();
-            MPI_Send(packedStats.data(), static_cast<int>(packedStats.size()), MPI_INT, dest, statsTag, MPI_COMM_WORLD);
+            MPI_Send(packedStats.data(), static_cast<int>(packedStats.size()), MPI_UNSIGNED, dest, statsTag, MPI_COMM_WORLD);
 
             sendCountMap(line.valueCounts, dest, countsBaseTag);
             sendCountMap(word.valueCounts, dest, countsBaseTag + 10);
@@ -424,9 +427,9 @@ int main(int argc, char* argv[]) {
         }
 
         void recvFromRank(int src, int statsTag, int countsBaseTag, int heapBaseTag) {
-            std::array<int, 4> packedStats = {0, 0, 0, 0};
+            std::array<CountType, 4> packedStats = {0, 0, 0, 0};
 
-            MPI_Recv(packedStats.data(), static_cast<int>(packedStats.size()), MPI_INT, src, statsTag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(packedStats.data(), static_cast<int>(packedStats.size()), MPI_UNSIGNED, src, statsTag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             unpackStats(packedStats);
 
             recvCountMap(line.valueCounts, src, countsBaseTag);
@@ -497,9 +500,9 @@ int main(int argc, char* argv[]) {
             while (std::getline(file, line)) {
                 std::istringstream ss(line);
                 std::string name;
-                int bytes = 0;
-                int words = 0;
-                int lines = 0;
+                CountType bytes = 0;
+                CountType words = 0;
+                CountType lines = 0;
                 if (std::getline(ss, name, ',') && ss >> bytes && ss.ignore() && ss >> words && ss.ignore() && ss >> lines) {
                     threadResults.addFileResult(name, lines, words, bytes);
                 }
