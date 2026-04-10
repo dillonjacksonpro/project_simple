@@ -13,7 +13,7 @@ set -euo pipefail
 
 # Hardcoded dataset directory for this job.
 # Update this path to your actual input directory before submitting.
-INPUT_DIR="/path/to/data"
+INPUT_DIR="/cluster/pixstor/class/cs4080/data/cc"
 NUM_NODES=4
 
 if [[ ! -d "$INPUT_DIR" ]]; then
