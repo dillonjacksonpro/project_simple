@@ -8,6 +8,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=1
 #SBATCH --threads-per-core=1
+#SBATCH --mem=8G
 #SBATCH --time=00:10:00
 
 set -euo pipefail
