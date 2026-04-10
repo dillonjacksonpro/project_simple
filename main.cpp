@@ -180,8 +180,10 @@ int main(int argc, char* argv[]) {
 
     class Results {
     private:
+        using CountEntry = std::pair<int, int>;
+
         struct MetricData {
-            std::vector<int> rawCounts;
+            std::vector<CountEntry> valueCounts;
             int total;
             double average;
             BoundedHeap top;
@@ -206,8 +208,55 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        static void insertCount(std::vector<CountEntry>& counts, int value, int frequency = 1) {
+            auto position = std::lower_bound(
+                counts.begin(),
+                counts.end(),
+                value,
+                [](const CountEntry& entry, int candidateValue) {
+                    return entry.first < candidateValue;
+                }
+            );
+
+            if (position != counts.end() && position->first == value) {
+                position->second += frequency;
+                return;
+            }
+
+            counts.insert(position, {value, frequency});
+        }
+
+        static void mergeCounts(std::vector<CountEntry>& target, const std::vector<CountEntry>& source) {
+            std::vector<CountEntry> merged;
+            merged.reserve(target.size() + source.size());
+
+            std::size_t left = 0;
+            std::size_t right = 0;
+            while (left < target.size() && right < source.size()) {
+                if (target[left].first < source[right].first) {
+                    merged.push_back(target[left++]);
+                } else if (source[right].first < target[left].first) {
+                    merged.push_back(source[right++]);
+                } else {
+                    merged.push_back({target[left].first, target[left].second + source[right].second});
+                    ++left;
+                    ++right;
+                }
+            }
+
+            while (left < target.size()) {
+                merged.push_back(target[left++]);
+            }
+
+            while (right < source.size()) {
+                merged.push_back(source[right++]);
+            }
+
+            target.swap(merged);
+        }
+
         static void addMetric(const std::string& fileName, int value, int currentTotalCount, MetricData& metric) {
-            metric.rawCounts.push_back(value);
+            insertCount(metric.valueCounts, value);
             metric.total += value;
             metric.average = currentTotalCount > 0 ? static_cast<double>(metric.total) / currentTotalCount : 0.0;
             metric.top.add(fileName, value);
@@ -216,6 +265,62 @@ int main(int argc, char* argv[]) {
 
         static void recomputeAverages(int currentTotalCount, MetricData& metric) {
             metric.average = currentTotalCount > 0 ? static_cast<double>(metric.total) / currentTotalCount : 0.0;
+        }
+
+        static MedianValue computeMedianFromCounts(const std::vector<CountEntry>& counts, int sampleCount) {
+            MedianValue median;
+            if (sampleCount <= 0 || counts.empty()) {
+                return median;
+            }
+
+            const int lowerIndex = (sampleCount - 1) / 2;
+            const int upperIndex = sampleCount / 2;
+            int runningIndex = 0;
+            int lowerMiddle = 0;
+            int upperMiddle = 0;
+            bool lowerFound = false;
+            bool upperFound = false;
+
+            for (const auto& [value, frequency] : counts) {
+                const int nextIndex = runningIndex + frequency - 1;
+                if (!lowerFound && lowerIndex >= runningIndex && lowerIndex <= nextIndex) {
+                    lowerMiddle = value;
+                    lowerFound = true;
+                }
+                if (!upperFound && upperIndex >= runningIndex && upperIndex <= nextIndex) {
+                    upperMiddle = value;
+                    upperFound = true;
+                }
+                if (lowerFound && upperFound) {
+                    break;
+                }
+                runningIndex += frequency;
+            }
+
+            median.upperMiddle = upperMiddle;
+            median.arithmetic = (sampleCount % 2 == 0)
+                ? (static_cast<double>(lowerMiddle) + static_cast<double>(upperMiddle)) / 2.0
+                : static_cast<double>(upperMiddle);
+            return median;
+        }
+
+        static void sendCountMap(const std::vector<CountEntry>& counts, int dest, int baseTag) {
+            int entryCount = static_cast<int>(counts.size());
+            MPI_Send(&entryCount, 1, MPI_INT, dest, baseTag, MPI_COMM_WORLD);
+            for (const auto& [value, frequency] : counts) {
+                const std::array<int, 2> entry = {value, frequency};
+                MPI_Send(entry.data(), static_cast<int>(entry.size()), MPI_INT, dest, baseTag + 1, MPI_COMM_WORLD);
+            }
+        }
+
+        static void recvCountMap(std::vector<CountEntry>& counts, int src, int baseTag) {
+            int entryCount = 0;
+            MPI_Recv(&entryCount, 1, MPI_INT, src, baseTag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            for (int idx = 0; idx < entryCount; ++idx) {
+                std::array<int, 2> entry = {0, 0};
+                MPI_Recv(entry.data(), static_cast<int>(entry.size()), MPI_INT, src, baseTag + 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                insertCount(counts, entry[0], entry[1]);
+            }
         }
 
         static void sendHeap(const BoundedHeap& heapObj, int dest, int baseTag) {
@@ -256,9 +361,9 @@ int main(int argc, char* argv[]) {
         void mergeFrom(const Results& other) {
             totalCount += other.totalCount;
 
-            line.rawCounts.insert(line.rawCounts.end(), other.line.rawCounts.begin(), other.line.rawCounts.end());
-            word.rawCounts.insert(word.rawCounts.end(), other.word.rawCounts.begin(), other.word.rawCounts.end());
-            character.rawCounts.insert(character.rawCounts.end(), other.character.rawCounts.begin(), other.character.rawCounts.end());
+            mergeCounts(line.valueCounts, other.line.valueCounts);
+            mergeCounts(word.valueCounts, other.word.valueCounts);
+            mergeCounts(character.valueCounts, other.character.valueCounts);
 
             line.total += other.line.total;
             word.total += other.word.total;
@@ -268,14 +373,6 @@ int main(int argc, char* argv[]) {
             recomputeAverages(totalCount, word);
             recomputeAverages(totalCount, character);
 
-            // Only one rank computes each median field; summation acts as selection during merge.
-            line.median.upperMiddle += other.line.median.upperMiddle;
-            line.median.arithmetic += other.line.median.arithmetic;
-            word.median.upperMiddle += other.word.median.upperMiddle;
-            word.median.arithmetic += other.word.median.arithmetic;
-            character.median.upperMiddle += other.character.median.upperMiddle;
-            character.median.arithmetic += other.character.median.arithmetic;
-
             mergeHeaps(line.top, other.line.top);
             mergeHeaps(line.bottom, other.line.bottom);
             mergeHeaps(word.top, other.word.top);
@@ -284,66 +381,39 @@ int main(int argc, char* argv[]) {
             mergeHeaps(character.bottom, other.character.bottom);
         }
 
-        const std::vector<int>& lineCounts() const { return line.rawCounts; }
-        const std::vector<int>& wordCounts() const { return word.rawCounts; }
-        const std::vector<int>& charCounts() const { return character.rawCounts; }
-
-        void clearRawCounts() {
-            line.rawCounts.clear();
-            word.rawCounts.clear();
-            character.rawCounts.clear();
+        void computeMedians() {
+            line.median = computeMedianFromCounts(line.valueCounts, totalCount);
+            word.median = computeMedianFromCounts(word.valueCounts, totalCount);
+            character.median = computeMedianFromCounts(character.valueCounts, totalCount);
         }
 
-        void setMedians(const MedianValue& lineMedian, const MedianValue& wordMedian, const MedianValue& charMedian) {
-            line.median = lineMedian;
-            word.median = wordMedian;
-            character.median = charMedian;
-        }
-
-        std::array<int, 7> packStats() const {
+        std::array<int, 4> packStats() const {
             return {
                 totalCount,
                 line.total,
                 word.total,
-                character.total,
-                line.median.upperMiddle,
-                word.median.upperMiddle,
-                character.median.upperMiddle
+                character.total
             };
         }
 
-        std::array<double, 3> packMedianArithmetic() const {
-            return {
-                line.median.arithmetic,
-                word.median.arithmetic,
-                character.median.arithmetic
-            };
-        }
-
-        void unpackStats(const std::array<int, 7>& packedStats,
-                         const std::array<double, 3>& packedMedianArithmetic) {
+        void unpackStats(const std::array<int, 4>& packedStats) {
             totalCount = packedStats[0];
             line.total = packedStats[1];
             word.total = packedStats[2];
             character.total = packedStats[3];
-            line.median.upperMiddle = packedStats[4];
-            word.median.upperMiddle = packedStats[5];
-            character.median.upperMiddle = packedStats[6];
-
-            line.median.arithmetic = packedMedianArithmetic[0];
-            word.median.arithmetic = packedMedianArithmetic[1];
-            character.median.arithmetic = packedMedianArithmetic[2];
 
             recomputeAverages(totalCount, line);
             recomputeAverages(totalCount, word);
             recomputeAverages(totalCount, character);
         }
 
-        void sendToRank(int dest, int statsTag, int medianTag, int heapBaseTag) const {
+        void sendToRank(int dest, int statsTag, int countsBaseTag, int heapBaseTag) const {
             const auto packedStats = packStats();
-            const auto packedMedian = packMedianArithmetic();
             MPI_Send(packedStats.data(), static_cast<int>(packedStats.size()), MPI_INT, dest, statsTag, MPI_COMM_WORLD);
-            MPI_Send(packedMedian.data(), static_cast<int>(packedMedian.size()), MPI_DOUBLE, dest, medianTag, MPI_COMM_WORLD);
+
+            sendCountMap(line.valueCounts, dest, countsBaseTag);
+            sendCountMap(word.valueCounts, dest, countsBaseTag + 10);
+            sendCountMap(character.valueCounts, dest, countsBaseTag + 20);
 
             sendHeap(line.top, dest, heapBaseTag);
             sendHeap(line.bottom, dest, heapBaseTag + 10);
@@ -353,13 +423,15 @@ int main(int argc, char* argv[]) {
             sendHeap(character.bottom, dest, heapBaseTag + 50);
         }
 
-        void recvFromRank(int src, int statsTag, int medianTag, int heapBaseTag) {
-            std::array<int, 7> packedStats = {0, 0, 0, 0, 0, 0, 0};
-            std::array<double, 3> packedMedianArithmetic = {0.0, 0.0, 0.0};
+        void recvFromRank(int src, int statsTag, int countsBaseTag, int heapBaseTag) {
+            std::array<int, 4> packedStats = {0, 0, 0, 0};
 
             MPI_Recv(packedStats.data(), static_cast<int>(packedStats.size()), MPI_INT, src, statsTag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            MPI_Recv(packedMedianArithmetic.data(), static_cast<int>(packedMedianArithmetic.size()), MPI_DOUBLE, src, medianTag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            unpackStats(packedStats, packedMedianArithmetic);
+            unpackStats(packedStats);
+
+            recvCountMap(line.valueCounts, src, countsBaseTag);
+            recvCountMap(word.valueCounts, src, countsBaseTag + 10);
+            recvCountMap(character.valueCounts, src, countsBaseTag + 20);
 
             recvHeap(line.top, src, heapBaseTag);
             recvHeap(line.bottom, src, heapBaseTag + 10);
@@ -443,161 +515,6 @@ int main(int argc, char* argv[]) {
     }
     logProgress("Completed local file processing.", true);
 
-    // define median variable for each node to store the median values for line count, word count, and char count
-    MedianValue medianLineCount;
-    MedianValue medianWordCount;
-    MedianValue medianCharCount;
-
-    // define a quick select function to calculate the median of a vector of integers
-    auto partition = [](std::vector<int>& nums, int left, int right) -> int {
-        int pivot = nums[static_cast<std::size_t>(right)];
-        int i = left;
-        for (int j = left; j < right; ++j) {
-            if (nums[static_cast<std::size_t>(j)] < pivot) {
-                std::swap(nums[static_cast<std::size_t>(i)], nums[static_cast<std::size_t>(j)]);
-                ++i;
-            }
-        }
-        std::swap(nums[static_cast<std::size_t>(i)], nums[static_cast<std::size_t>(right)]);
-        return i;
-    };
-
-    auto quickSelect = [&partition](std::vector<int>& nums, int k) -> int {
-        int left = 0;
-        int right = static_cast<int>(nums.size()) - 1;
-        while (left <= right) {
-            int pivotIndex = partition(nums, left, right);
-            if (pivotIndex == k) {
-                return nums[static_cast<std::size_t>(pivotIndex)];
-            } else if (pivotIndex < k) {
-                left = pivotIndex + 1;
-            } else {
-                right = pivotIndex - 1;
-            }
-        }
-        return -1; // should never reach here
-    };
-
-    auto computeMedianValues = [&quickSelect](std::vector<int>& values) -> MedianValue {
-        MedianValue median;
-        if (values.empty()) {
-            return median;
-        }
-
-        int upperIndex = static_cast<int>(values.size() / 2);
-        median.upperMiddle = quickSelect(values, upperIndex);
-
-        if (values.size() % 2 == 1) {
-            median.arithmetic = static_cast<double>(median.upperMiddle);
-        } else {
-            int lowerMiddle = quickSelect(values, upperIndex - 1);
-            median.arithmetic = (static_cast<double>(lowerMiddle) + static_cast<double>(median.upperMiddle)) / 2.0;
-        }
-
-        return median;
-    };
-
-    auto gatherValuesToReducer = [rank, size](const std::vector<int>& localValues, int reducerRank) {
-        int localSize = static_cast<int>(localValues.size());
-
-        std::vector<int> recvCounts;
-        if (rank == reducerRank) {
-            recvCounts.resize(static_cast<std::size_t>(size), 0);
-        }
-
-        MPI_Gather(
-            &localSize,
-            1,
-            MPI_INT,
-            rank == reducerRank ? recvCounts.data() : nullptr,
-            1,
-            MPI_INT,
-            reducerRank,
-            MPI_COMM_WORLD
-        );
-
-        std::vector<int> displacements;
-        int totalCount = 0;
-        if (rank == reducerRank) {
-            displacements.resize(static_cast<std::size_t>(size), 0);
-            for (int i = 0; i < size; ++i) {
-                displacements[static_cast<std::size_t>(i)] = totalCount;
-                totalCount += recvCounts[static_cast<std::size_t>(i)];
-            }
-        }
-
-        std::vector<int> gatheredValues;
-        if (rank == reducerRank) {
-            gatheredValues.resize(static_cast<std::size_t>(totalCount));
-        }
-
-        MPI_Gatherv(
-            localSize > 0 ? localValues.data() : nullptr,
-            localSize,
-            MPI_INT,
-            rank == reducerRank ? gatheredValues.data() : nullptr,
-            rank == reducerRank ? recvCounts.data() : nullptr,
-            rank == reducerRank ? displacements.data() : nullptr,
-            MPI_INT,
-            reducerRank,
-            MPI_COMM_WORLD
-        );
-
-        return gatheredValues;
-    };
-
-    // Gather each metric to its designated reducer rank.
-    logProgress("Gathering raw metric counts for median reducers.");
-    std::vector<int> allLineCounts = gatherValuesToReducer(nodeResults.lineCounts(), 1);
-    std::vector<int> allWordCounts = gatherValuesToReducer(nodeResults.wordCounts(), 2);
-    std::vector<int> allCharCounts = gatherValuesToReducer(nodeResults.charCounts(), 3);
-
-    // We no longer need local raw vectors after global median inputs are gathered.
-    nodeResults.clearRawCounts();
-
-    if (rank == 1 && !allLineCounts.empty()) {
-        medianLineCount = computeMedianValues(allLineCounts);
-        allLineCounts.clear();
-        allLineCounts.shrink_to_fit();
-    }
-    if (rank == 2 && !allWordCounts.empty()) {
-        medianWordCount = computeMedianValues(allWordCounts);
-        allWordCounts.clear();
-        allWordCounts.shrink_to_fit();
-    }
-    if (rank == 3 && !allCharCounts.empty()) {
-        medianCharCount = computeMedianValues(allCharCounts);
-        allCharCounts.clear();
-        allCharCounts.shrink_to_fit();
-    }
-
-    auto broadcastMedian = [](MedianValue& median, int reducerRank) {
-        MPI_Bcast(&median.upperMiddle, 1, MPI_INT, reducerRank, MPI_COMM_WORLD);
-        MPI_Bcast(&median.arithmetic, 1, MPI_DOUBLE, reducerRank, MPI_COMM_WORLD);
-    };
-
-    // Broadcast medians from each reducer so every rank has a complete median set.
-    broadcastMedian(medianLineCount, 1);
-    broadcastMedian(medianWordCount, 2);
-    broadcastMedian(medianCharCount, 3);
-    logProgress("Median values computed and broadcast to all ranks.");
-
-    if (rank == 1) {
-        std::cout << "Median line count (upper-middle): " << medianLineCount.upperMiddle
-                  << ", arithmetic: " << medianLineCount.arithmetic << std::endl;
-    }
-    if (rank == 2) {
-        std::cout << "Median word count (upper-middle): " << medianWordCount.upperMiddle
-                  << ", arithmetic: " << medianWordCount.arithmetic << std::endl;
-    }
-    if (rank == 3) {
-        std::cout << "Median char count (upper-middle): " << medianCharCount.upperMiddle
-                  << ", arithmetic: " << medianCharCount.arithmetic << std::endl;
-    }
-
-    // set median values to results struct for this node
-    nodeResults.setMedians(medianLineCount, medianWordCount, medianCharCount);
-
     // gather each node results to rank 0 and merge them into a final results object
     Results finalResults;
     if (rank == 0) {
@@ -606,12 +523,13 @@ int main(int argc, char* argv[]) {
         for (int i = 1; i < size; ++i) {
             Results recvResults;
 
-            recvResults.recvFromRank(i, 100, 101, 110);
+            recvResults.recvFromRank(i, 100, 110, 140);
             finalResults.mergeFrom(recvResults);
         }
+        finalResults.computeMedians();
         logProgress("Final aggregation complete.");
     } else {
-        nodeResults.sendToRank(0, 100, 101, 110);
+        nodeResults.sendToRank(0, 100, 110, 140);
     }
 
     // finalize mpi
