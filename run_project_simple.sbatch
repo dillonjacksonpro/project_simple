@@ -11,16 +11,10 @@
 
 set -euo pipefail
 
-# Optional overrides when submitting:
-#   sbatch --partition=compute --export=ALL,INPUT_DIR=/path/to/data run_project_simple.sbatch
-INPUT_DIR="${INPUT_DIR:-}"
+# Hardcoded dataset directory for this job.
+# Update this path to your actual input directory before submitting.
+INPUT_DIR="/path/to/data"
 NUM_NODES=4
-
-if [[ -z "$INPUT_DIR" ]]; then
-    echo "Error: INPUT_DIR is not set."
-    echo "Submit with: sbatch --export=ALL,INPUT_DIR=/path/to/data run_project_simple.sbatch"
-    exit 1
-fi
 
 if [[ ! -d "$INPUT_DIR" ]]; then
     echo "Error: INPUT_DIR does not exist or is not a directory: $INPUT_DIR"
@@ -37,6 +31,7 @@ if [[ ! -x "$EXECUTABLE" ]]; then
 fi
 
 # Keep OpenMP deterministic by default; users can override OMP_NUM_THREADS.
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
-srun "$EXECUTABLE" "$INPUT_DIR" "$NUM_NODES"
+# Launch step with a clean exported environment to avoid inherited SLURM_MEM_PER_* conflicts.
+srun --export=NONE,OMP_NUM_THREADS="$OMP_NUM_THREADS" "$EXECUTABLE" "$INPUT_DIR" "$NUM_NODES"
