@@ -780,9 +780,6 @@ int main(int argc, char* argv[]) {
             recvResults.recvSummaryFromRank(i, 100, 140);
             finalResults.mergeSummaryFrom(recvResults);
         }
-        for (int metricIndex = 0; metricIndex < 3; ++metricIndex) {
-            finalResults.recvMedianFromRank(metricIndex, medianOwners[static_cast<std::size_t>(metricIndex)], medianValueTagBase + metricIndex * 10);
-        }
         logProgress("Final aggregation complete.");
     } else if (rank > 0) {
         nodeResults.sendSummaryToRank(0, 100, 140);
