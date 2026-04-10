@@ -1,4 +1,4 @@
-// get all header info
+// Standard library and MPI/OpenMP headers.
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -22,8 +22,12 @@ using CountType = unsigned int;
 using TotalType = std::uint64_t;
 using Clock = std::chrono::steady_clock;
 
+// Metric index mapping used throughout the program.
+// 0 -> lines, 1 -> words, 2 -> bytes/characters.
+
 
 int main(int argc, char* argv[]) {
+    // This build is intended to run with a fixed 16-rank MPI layout.
     constexpr int expectedRanks = 16;
     constexpr std::size_t timingPartCount = 8;
     constexpr std::array<const char*, timingPartCount - 1> timingLabels = {
@@ -36,7 +40,7 @@ int main(int argc, char* argv[]) {
         "Median value exchange"
     };
 
-    // init mpi first so any fatal validation can fail collectively
+    // Initialize MPI first so any validation error can abort the whole job.
     MPI_Init(&argc, &argv);
     int rank = 0;
     int size = 0;
@@ -49,7 +53,7 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    // args: directory path and expected node count
+    // Expect a directory path plus the requested node count.
     if (argc < 3) {
         if (rank == 0) {
             std::cerr << "Usage: " << argv[0] << " <directory_path> <num_nodes>" << std::endl;
@@ -62,12 +66,13 @@ int main(int argc, char* argv[]) {
     auto elapsedSeconds = [](const Clock::time_point& start, const Clock::time_point& end) {
         return std::chrono::duration<double>(end - start).count();
     };
-    // check if the provided path is a valid directory
+    // Validate the input directory before scanning it.
     if (!std::filesystem::is_directory(directoryPath)) {
         std::cerr << "Rank " << rank << " error: " << directoryPath << " is not a valid directory." << std::endl;
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    // use fstat to get entries in the directory
+
+    // Collect regular files and sort them so every rank sees the same order.
     std::vector<std::string> fileNames;
     for (const auto& entry : std::filesystem::directory_iterator(directoryPath)) {
         if (entry.is_regular_file()) {
@@ -105,7 +110,8 @@ int main(int argc, char* argv[]) {
     }
     logProgress("Validated MPI world size and input arguments.");
 
-    // split work with quotient/remainder so every file is assigned exactly once
+    // Split work with quotient/remainder so every file is assigned exactly once.
+    // First `extraFiles` ranks process one additional file.
     const int totalFiles = static_cast<int>(fileNames.size());
     const int baseFilesPerRank = totalFiles / numNodes;
     const int extraFiles = totalFiles % numNodes;
@@ -114,6 +120,7 @@ int main(int argc, char* argv[]) {
     const int end = start + localFileCount;
     std::cout << "Node " << rank << " processing files from index " << start << " to " << end - 1 << std::endl;
 
+    // A bounded heap keeps only the top or bottom N entries for a metric.
     class BoundedHeap {
     private:
         using Entry = std::pair<std::string, CountType>;
@@ -179,7 +186,7 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    
+
     struct MedianValue {
         CountType upperMiddle;
         double arithmetic;
@@ -187,6 +194,7 @@ int main(int argc, char* argv[]) {
         MedianValue() : upperMiddle(0), arithmetic(0.0) {}
     };
 
+    // Aggregated per-rank statistics and the MPI helpers used to merge them.
     class Results {
     private:
         using CountEntry = std::pair<CountType, CountType>;
@@ -246,6 +254,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (signedValue < 0) {
+                    // Treat negative counts as zero so malformed rows are tolerated.
                     value = 0;
                     return true;
                 }
@@ -279,7 +288,7 @@ int main(int argc, char* argv[]) {
                 return value.substr(first, last - first + 1);
             };
 
-            // Find the final 3 delimiters from the right. This keeps names intact even when they contain commas.
+            // Find the last 3 delimiters from the right so quoted names can contain commas.
             std::array<std::size_t, 3> delimiterPos = {std::string::npos, std::string::npos, std::string::npos};
             int foundDelimiters = 0;
             bool inQuotes = false;
@@ -335,12 +344,14 @@ int main(int argc, char* argv[]) {
 
     private:
         static void mergeHeaps(BoundedHeap& target, const BoundedHeap& source) {
+            // Reinsert source entries to preserve target heap size constraints.
             for (const auto& entry : source.entries()) {
                 target.add(entry.first, entry.second);
             }
         }
 
         static void insertCount(std::vector<CountEntry>& counts, CountType value, CountType frequency = 1) {
+            // Keep the histogram sorted by value for efficient median lookup later.
             auto position = std::lower_bound(
                 counts.begin(),
                 counts.end(),
@@ -359,6 +370,7 @@ int main(int argc, char* argv[]) {
         }
 
         static void mergeCounts(std::vector<CountEntry>& target, const std::vector<CountEntry>& source) {
+            // Merge two sorted histograms in linear time.
             std::vector<CountEntry> merged;
             merged.reserve(target.size() + source.size());
 
@@ -417,6 +429,7 @@ int main(int argc, char* argv[]) {
             bool lowerFound = false;
             bool upperFound = false;
 
+            // Walk histogram buckets until both median positions are covered.
             for (const auto& [value, frequency] : counts) {
                 const TotalType nextIndex = runningIndex + frequency - 1;
                 if (!lowerFound && lowerIndex >= runningIndex && lowerIndex <= nextIndex) {
@@ -441,6 +454,7 @@ int main(int argc, char* argv[]) {
         }
 
         static void sendCountMap(const std::vector<CountEntry>& counts, int dest, int baseTag) {
+            // Send as (value, frequency) pairs to avoid serializing complex containers.
             int entryCount = static_cast<int>(counts.size());
             MPI_Send(&entryCount, 1, MPI_INT, dest, baseTag, MPI_COMM_WORLD);
             for (const auto& [value, frequency] : counts) {
@@ -460,6 +474,7 @@ int main(int argc, char* argv[]) {
         }
 
         static void sendHeap(const BoundedHeap& heapObj, int dest, int baseTag) {
+            // File names have variable length, so send length + bytes for each entry.
             int heapSize = static_cast<int>(heapObj.entries().size());
             MPI_Send(&heapSize, 1, MPI_INT, dest, baseTag, MPI_COMM_WORLD);
             for (const auto& entry : heapObj.entries()) {
@@ -495,6 +510,7 @@ int main(int argc, char* argv[]) {
         }
 
         void mergeFrom(const Results& other) {
+            // Full merge includes histograms so medians can be recomputed globally.
             totalCount += other.totalCount;
 
             mergeCounts(line.valueCounts, other.line.valueCounts);
@@ -518,6 +534,7 @@ int main(int argc, char* argv[]) {
         }
 
         void mergeSummaryFrom(const Results& other) {
+            // Lightweight merge used for final reporting when medians are handled separately.
             totalCount += other.totalCount;
 
             line.total += other.line.total;
@@ -575,6 +592,7 @@ int main(int argc, char* argv[]) {
         }
 
         void sendSummaryToRank(int dest, int statsTag, int heapBaseTag) const {
+            // Tag blocks are spaced by +10 to keep each metric channel distinct.
             const auto packedStats = packStats();
             MPI_Send(packedStats.data(), static_cast<int>(packedStats.size()), MPI_UINT64_T, dest, statsTag, MPI_COMM_WORLD);
 
@@ -680,7 +698,7 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    // create a results object for this node
+    // Per-rank state used for local aggregation before MPI reductions.
     Results nodeResults;
     TotalType nodeRowsSeen = 0;
     TotalType nodeRowsParsed = 0;
@@ -689,7 +707,7 @@ int main(int argc, char* argv[]) {
 
     const auto localProcessingStart = Clock::now();
 
-    // use openmp to parallelize the processing of files for this node
+    // Process the assigned files in parallel across OpenMP threads.
     #pragma omp parallel
     {
         Results threadResults;
@@ -699,7 +717,6 @@ int main(int argc, char* argv[]) {
 
         #pragma omp for nowait
         for (int i = start; i < end; ++i) {
-            // process the file to get line count, word count, and character count
             std::ifstream file(fileNames[static_cast<std::size_t>(i)]);
             if (!file.is_open()) {
                 #pragma omp critical
@@ -714,9 +731,7 @@ int main(int argc, char* argv[]) {
 
             std::string line;
 
-            // the open file is formatted in a csv like this
-            // name, bytes, words, lines
-            // we need to parse the line to get the counts
+            // Each input line is a CSV record in the form: name, bytes, words, lines.
             while (std::getline(file, line)) {
                 ++threadRowsSeen;
                 std::string name;
@@ -733,7 +748,7 @@ int main(int argc, char* argv[]) {
             file.close();
         }
 
-        // merge once per thread to reduce contention
+        // Merge once per thread to keep contention low.
         #pragma omp critical
         {
             nodeResults.mergeFrom(threadResults);
@@ -748,6 +763,7 @@ int main(int argc, char* argv[]) {
     std::array<TotalType, 3> nodeParseCounters = {nodeRowsSeen, nodeRowsParsed, nodeRowsSkipped};
     std::array<TotalType, 3> globalParseCounters = {0, 0, 0};
     const auto parseReduceStart = Clock::now();
+    // Aggregate row-level quality counters onto rank 0.
     MPI_Reduce(
         nodeParseCounters.data(),
         globalParseCounters.data(),
@@ -762,6 +778,7 @@ int main(int argc, char* argv[]) {
     const TotalType localFileTotal = nodeResults.packStats()[0];
     TotalType globalFileTotal = 0;
     const auto globalTotalReduceStart = Clock::now();
+    // Every rank needs the global sample count for median computation.
     MPI_Allreduce(&localFileTotal, &globalFileTotal, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
     localTimings[2] = elapsedSeconds(globalTotalReduceStart, Clock::now());
 
@@ -769,6 +786,7 @@ int main(int argc, char* argv[]) {
     constexpr int medianCountsTagBase = 200;
     constexpr int medianValueTagBase = 260;
 
+    // Distribute median work: one owner rank per metric collects and computes.
     const auto medianCountExchangeStart = Clock::now();
     for (int metricIndex = 0; metricIndex < 3; ++metricIndex) {
         const int ownerRank = medianOwners[static_cast<std::size_t>(metricIndex)];
@@ -789,6 +807,7 @@ int main(int argc, char* argv[]) {
     localTimings[3] = elapsedSeconds(medianCountExchangeStart, Clock::now());
 
     const auto medianCalculationStart = Clock::now();
+    // Owner ranks recompute from merged histograms to ensure deterministic medians.
     for (int metricIndex = 0; metricIndex < 3; ++metricIndex) {
         const int ownerRank = medianOwners[static_cast<std::size_t>(metricIndex)];
         if (rank == ownerRank) {
@@ -797,7 +816,7 @@ int main(int argc, char* argv[]) {
     }
     localTimings[4] = elapsedSeconds(medianCalculationStart, Clock::now());
 
-    // gather the non-median summary data to rank 0 and merge it into a final results object
+    // Gather non-median summary data to rank 0 for the final report.
     Results finalResults;
     const auto finalAggregationStart = Clock::now();
     if (rank == 0) {
@@ -818,6 +837,7 @@ int main(int argc, char* argv[]) {
     MPI_Barrier(MPI_COMM_WORLD);
 
     const auto medianValueExchangeStart = Clock::now();
+    // Send finalized median values from owner ranks to rank 0 for final output.
     if (rank == 0) {
         for (int metricIndex = 0; metricIndex < 3; ++metricIndex) {
             finalResults.recvMedianFromRank(metricIndex, medianOwners[static_cast<std::size_t>(metricIndex)], medianValueTagBase + metricIndex * 10);
@@ -835,6 +855,7 @@ int main(int argc, char* argv[]) {
     if (rank == 0) {
         gatheredTimings.resize(static_cast<std::size_t>(size) * timingPartCount, 0.0);
     }
+    // Gather per-rank stage timings so rank 0 can print totals and averages.
     MPI_Gather(
         localTimings.data(),
         static_cast<int>(timingPartCount),
@@ -846,10 +867,10 @@ int main(int argc, char* argv[]) {
         MPI_COMM_WORLD
     );
 
-    // finalize mpi
+    // Cleanly shut down MPI before printing the final report.
     MPI_Finalize();
 
-    // output final results only on rank 0
+    // Only rank 0 prints the final aggregated results.
     if (rank == 0) {
         finalResults.printSummary(std::cout);
         std::cout << "rows_seen: " << globalParseCounters[0] << std::endl;
