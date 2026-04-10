@@ -202,6 +202,32 @@ int main(int argc, char* argv[]) {
         MetricData word;
         MetricData character;
 
+        MetricData& metricForIndex(int metricIndex) {
+            switch (metricIndex) {
+                case 0:
+                    return line;
+                case 1:
+                    return word;
+                case 2:
+                    return character;
+                default:
+                    throw std::out_of_range("metricIndex out of range");
+            }
+        }
+
+        const MetricData& metricForIndex(int metricIndex) const {
+            switch (metricIndex) {
+                case 0:
+                    return line;
+                case 1:
+                    return word;
+                case 2:
+                    return character;
+                default:
+                    throw std::out_of_range("metricIndex out of range");
+            }
+        }
+
         static bool parseNonNegativeCount(const std::string& field, CountType& value) {
             try {
                 std::size_t parsed = 0;
@@ -482,10 +508,41 @@ int main(int argc, char* argv[]) {
             mergeHeaps(character.bottom, other.character.bottom);
         }
 
+        void mergeSummaryFrom(const Results& other) {
+            totalCount += other.totalCount;
+
+            line.total += other.line.total;
+            word.total += other.word.total;
+            character.total += other.character.total;
+
+            recomputeAverages(totalCount, line);
+            recomputeAverages(totalCount, word);
+            recomputeAverages(totalCount, character);
+
+            mergeHeaps(line.top, other.line.top);
+            mergeHeaps(line.bottom, other.line.bottom);
+            mergeHeaps(word.top, other.word.top);
+            mergeHeaps(word.bottom, other.word.bottom);
+            mergeHeaps(character.top, other.character.top);
+            mergeHeaps(character.bottom, other.character.bottom);
+        }
+
         void computeMedians() {
             line.median = computeMedianFromCounts(line.valueCounts, totalCount);
             word.median = computeMedianFromCounts(word.valueCounts, totalCount);
             character.median = computeMedianFromCounts(character.valueCounts, totalCount);
+        }
+
+        void computeMedianForMetric(int metricIndex, TotalType sampleCount) {
+            metricForIndex(metricIndex).median = computeMedianFromCounts(metricForIndex(metricIndex).valueCounts, sampleCount);
+        }
+
+        void setMedianForMetric(int metricIndex, const MedianValue& median) {
+            metricForIndex(metricIndex).median = median;
+        }
+
+        MedianValue getMedianForMetric(int metricIndex) const {
+            return metricForIndex(metricIndex).median;
         }
 
         std::array<TotalType, 4> packStats() const {
@@ -506,6 +563,53 @@ int main(int argc, char* argv[]) {
             recomputeAverages(totalCount, line);
             recomputeAverages(totalCount, word);
             recomputeAverages(totalCount, character);
+        }
+
+        void sendSummaryToRank(int dest, int statsTag, int heapBaseTag) const {
+            const auto packedStats = packStats();
+            MPI_Send(packedStats.data(), static_cast<int>(packedStats.size()), MPI_UINT64_T, dest, statsTag, MPI_COMM_WORLD);
+
+            sendHeap(line.top, dest, heapBaseTag);
+            sendHeap(line.bottom, dest, heapBaseTag + 10);
+            sendHeap(word.top, dest, heapBaseTag + 20);
+            sendHeap(word.bottom, dest, heapBaseTag + 30);
+            sendHeap(character.top, dest, heapBaseTag + 40);
+            sendHeap(character.bottom, dest, heapBaseTag + 50);
+        }
+
+        void recvSummaryFromRank(int src, int statsTag, int heapBaseTag) {
+            std::array<TotalType, 4> packedStats = {0, 0, 0, 0};
+
+            MPI_Recv(packedStats.data(), static_cast<int>(packedStats.size()), MPI_UINT64_T, src, statsTag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            unpackStats(packedStats);
+
+            recvHeap(line.top, src, heapBaseTag);
+            recvHeap(line.bottom, src, heapBaseTag + 10);
+            recvHeap(word.top, src, heapBaseTag + 20);
+            recvHeap(word.bottom, src, heapBaseTag + 30);
+            recvHeap(character.top, src, heapBaseTag + 40);
+            recvHeap(character.bottom, src, heapBaseTag + 50);
+        }
+
+        void sendMetricCountsToRank(int metricIndex, int dest, int baseTag) const {
+            sendCountMap(metricForIndex(metricIndex).valueCounts, dest, baseTag);
+        }
+
+        void recvMetricCountsFromRank(int metricIndex, int src, int baseTag) {
+            recvCountMap(metricForIndex(metricIndex).valueCounts, src, baseTag);
+        }
+
+        void sendMedianToRank(int dest, int metricIndex, int baseTag) const {
+            const MedianValue& median = metricForIndex(metricIndex).median;
+            MPI_Send(&median.upperMiddle, 1, MPI_UNSIGNED, dest, baseTag, MPI_COMM_WORLD);
+            MPI_Send(&median.arithmetic, 1, MPI_DOUBLE, dest, baseTag + 1, MPI_COMM_WORLD);
+        }
+
+        void recvMedianFromRank(int metricIndex, int src, int baseTag) {
+            MedianValue median;
+            MPI_Recv(&median.upperMiddle, 1, MPI_UNSIGNED, src, baseTag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(&median.arithmetic, 1, MPI_DOUBLE, src, baseTag + 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            setMedianForMetric(metricIndex, median);
         }
 
         void sendToRank(int dest, int statsTag, int countsBaseTag, int heapBaseTag) const {
@@ -640,21 +744,59 @@ int main(int argc, char* argv[]) {
         MPI_COMM_WORLD
     );
 
-    // gather each node results to rank 0 and merge them into a final results object
+    const TotalType localFileTotal = nodeResults.packStats()[0];
+    TotalType globalFileTotal = 0;
+    MPI_Allreduce(&localFileTotal, &globalFileTotal, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+
+    constexpr std::array<int, 3> medianOwners = {1, 2, 3};
+    constexpr int medianCountsTagBase = 200;
+    constexpr int medianValueTagBase = 260;
+
+    for (int metricIndex = 0; metricIndex < 3; ++metricIndex) {
+        const int ownerRank = medianOwners[static_cast<std::size_t>(metricIndex)];
+        const int countTagBase = medianCountsTagBase + metricIndex * 10;
+
+        if (rank == ownerRank) {
+            for (int src = 0; src < size; ++src) {
+                if (src == ownerRank) {
+                    continue;
+                }
+                nodeResults.recvMetricCountsFromRank(metricIndex, src, countTagBase);
+            }
+            nodeResults.computeMedianForMetric(metricIndex, globalFileTotal);
+        } else {
+            nodeResults.sendMetricCountsToRank(metricIndex, ownerRank, countTagBase);
+        }
+    }
+
+    // gather the non-median summary data to rank 0 and merge it into a final results object
     Results finalResults;
     if (rank == 0) {
         logProgress("Starting final aggregation on rank 0.");
-        finalResults.mergeFrom(nodeResults);
+        finalResults.mergeSummaryFrom(nodeResults);
         for (int i = 1; i < size; ++i) {
             Results recvResults;
 
-            recvResults.recvFromRank(i, 100, 110, 140);
-            finalResults.mergeFrom(recvResults);
+            recvResults.recvSummaryFromRank(i, 100, 140);
+            finalResults.mergeSummaryFrom(recvResults);
         }
-        finalResults.computeMedians();
+        for (int metricIndex = 0; metricIndex < 3; ++metricIndex) {
+            finalResults.recvMedianFromRank(metricIndex, medianOwners[static_cast<std::size_t>(metricIndex)], medianValueTagBase + metricIndex * 10);
+        }
         logProgress("Final aggregation complete.");
-    } else {
-        nodeResults.sendToRank(0, 100, 110, 140);
+    } else if (rank > 0) {
+        nodeResults.sendSummaryToRank(0, 100, 140);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        for (int metricIndex = 0; metricIndex < 3; ++metricIndex) {
+            finalResults.recvMedianFromRank(metricIndex, medianOwners[static_cast<std::size_t>(metricIndex)], medianValueTagBase + metricIndex * 10);
+        }
+    } else if (rank >= 1 && rank <= 3) {
+        const int metricIndex = rank - 1;
+        nodeResults.sendMedianToRank(0, metricIndex, medianValueTagBase + metricIndex * 10);
     }
 
     // finalize mpi
